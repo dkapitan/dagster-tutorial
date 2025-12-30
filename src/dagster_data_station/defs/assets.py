@@ -4,6 +4,7 @@ from pathlib import Path
 import dagster as dg
 from dagster_polars import PolarsParquetIOManager
 import polars as pl
+import duckdb
 
 
 # Define root directory
@@ -76,7 +77,7 @@ def build_vocabulary_asset(table_name: str, file_path: Path) -> dg.AssetsDefinit
 
         try:
             # Determine separator based on file extension
-            separator = "," if file_path.suffix == ".csv" else "\t"
+            separator = "\t"
 
             # Load with Polars - handle ragged lines and encoding issues
             df = pl.read_csv(
@@ -86,6 +87,7 @@ def build_vocabulary_asset(table_name: str, file_path: Path) -> dg.AssetsDefinit
                 truncate_ragged_lines=True,  # Handle rows with extra columns
                 ignore_errors=True,  # Skip rows that can't be parsed
                 encoding="utf8-lossy",  # Handle encoding issues gracefully
+                quote_char=None # CSVs contain quotes!
             )
 
             context.log.info(
@@ -126,6 +128,81 @@ def load_cbs_job_from_yaml(yaml_path: str) -> dg.Definitions:
     return dg.Definitions.merge(*defs)
 
 
+def build_omop_duckdb_asset(vocab_files: list[tuple[str, Path]]) -> dg.AssetsDefinition:
+    """
+    Build a DuckDB asset that combines all OMOP vocabulary tables.
+
+    Args:
+        vocab_files: List of (table_name, file_path) tuples
+
+    Returns:
+        Dagster asset definition for the combined DuckDB database
+    """
+    # Create list of upstream asset keys
+    upstream_assets = [dg.AssetKey(f"vocab_{table_name}") for table_name, _ in vocab_files]
+
+    @dg.asset(
+        name="omop_vocabularies_duckdb",
+        deps=upstream_assets,
+        description="Combined OMOP vocabulary tables in DuckDB format",
+        group_name="OMOP",
+        kinds={"duckdb"},
+        metadata={
+            "num_tables": len(vocab_files),
+            "table_names": [table_name for table_name, _ in vocab_files],
+        },
+    )
+    def omop_vocabularies_duckdb(context: dg.AssetExecutionContext) -> None:
+        """Combine all vocabulary parquet files into a single DuckDB database."""
+        db_path = root / "datalake" / "vocabularies" / "omop-vocabularies.duckdb"
+
+        # Ensure directory exists
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Remove existing database if present
+        if db_path.exists():
+            db_path.unlink()
+
+        context.log.info(f"🦆 Creating DuckDB database at {db_path}")
+
+        # Connect to DuckDB
+        con = duckdb.connect(str(db_path))
+
+        try:
+            # Get the base directory for parquet files
+            parquet_base_dir = root / "datalake" / "vocabularies"
+
+            # Import each vocabulary table
+            for table_name, _ in vocab_files:
+                parquet_path = parquet_base_dir / f"vocab_{table_name}.parquet"
+
+                if parquet_path.exists():
+                    context.log.info(f"📥 Loading {table_name} into DuckDB")
+
+                    # Read parquet and create table in DuckDB
+                    con.execute(f"""
+                        CREATE TABLE {table_name} AS
+                        SELECT * FROM read_parquet('{parquet_path}')
+                    """)
+
+                    # Get row count for logging
+                    row_count = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                    context.log.info(f"✅ Loaded {table_name}: {row_count:,} rows")
+                else:
+                    context.log.warning(f"⚠️  Parquet file not found for {table_name}")
+
+            # Get database stats
+            tables = con.execute("SHOW TABLES").fetchall()
+            total_size = db_path.stat().st_size / (1024 * 1024)  # MB
+
+            context.log.info(f"🎉 Created DuckDB with {len(tables)} tables, size: {total_size:.2f} MB")
+
+        finally:
+            con.close()
+
+    return omop_vocabularies_duckdb
+
+
 @dg.definitions
 def vocab_defs():
     """Vocabulary asset definitions - dynamically created from source files"""
@@ -140,6 +217,9 @@ def vocab_defs():
         build_vocabulary_asset(table_name, file_path)
         for table_name, file_path in vocab_files
     ]
+
+    # Add the combined DuckDB asset
+    vocab_assets.append(build_omop_duckdb_asset(vocab_files))
 
     return dg.Definitions(assets=vocab_assets)
 
